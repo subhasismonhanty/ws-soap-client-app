@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<wsdl:definitions xmlns:wsdl="http://schemas.xmlsoap.org/wsdl/"
+                  xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"
+                  xmlns:tns="http://tempuri.org/"
+                  targetNamespace="http://tempuri.org/">
+    
+    <wsdl:types>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="http://tempuri.org/">
+            <xs:element name="Add">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="intA" type="xs:int"/>
+                        <xs:element name="intB" type="xs:int"/>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+            <xs:element name="AddResponse">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="AddResult" type="xs:int"/>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>
+    </wsdl:types>
+
+    <wsdl:message name="AddSoapIn">
+        <wsdl:part name="parameters" element="tns:Add"/>
+    </wsdl:message>
+    <wsdl:message name="AddSoapOut">
+        <wsdl:part name="parameters" element="tns:AddResponse"/>
+    </wsdl:message>
+
+    <wsdl:portType name="CalculatorSoap">
+        <wsdl:operation name="Add">
+            <wsdl:input message="tns:AddSoapIn"/>
+            <wsdl:output message="tns:AddSoapOut"/>
+        </wsdl:operation>
+    </wsdl:portType>
+
+    <wsdl:binding name="CalculatorSoap" type="tns:CalculatorSoap">
+        <soap:binding transport="http://schemas.xmlsoap.org/soap/http"/>
+        <wsdl:operation name="Add">
+            <soap:operation soapAction="http://tempuri.org/Add"/>
+            <wsdl:input>
+                <soap:body use="literal"/>
+            </wsdl:input>
+            <wsdl:output>
+                <soap:body use="literal"/>
+            </wsdl:output>
+        </wsdl:operation>
+    </wsdl:binding>
+
+    <wsdl:service name="Calculator">
+        <wsdl:port name="CalculatorSoap" binding="tns:CalculatorSoap">
+            <soap:address location="http://www.dneonline.com/calculator.asmx"/>
+        </wsdl:port>
+    </wsdl:service>
+</wsdl:definitions> 
