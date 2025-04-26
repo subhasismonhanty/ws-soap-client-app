@@ -24,13 +24,14 @@ import javax.xml.transform.dom.DOMSource;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import org.xml.sax.InputSource;
-import java.io.StringReader;
+
+import java.io.*;
+
 import org.w3c.dom.Document;
 import javax.annotation.PostConstruct;
 import javax.xml.namespace.QName;
 import javax.xml.transform.Source;
 import javax.xml.transform.stream.StreamResult;
-import java.io.StringWriter;
 import java.security.*;
 import java.text.SimpleDateFormat;
 import java.util.Date;
@@ -40,9 +41,6 @@ import java.util.Base64;
 
 import org.apache.xml.security.c14n.Canonicalizer;
 
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
-import java.io.FileNotFoundException;
 import java.nio.charset.StandardCharsets;
 
 @Service
@@ -246,27 +244,39 @@ public class SoapProxyService {
     }
 
     private String createSignature(String algorithm, String canonValue) throws Exception {
-        // Load the keystore from classpath
+        // Load the keystore from external path
         KeyStore keystore = KeyStore.getInstance("JKS");
-        try (InputStream is = getClass().getResourceAsStream(keystorePath)) {
-            if (is == null) {
-                throw new FileNotFoundException("Keystore file not found at: " + keystorePath);
+
+        // Check if the path starts with "file:" or "classpath:"
+        String path = keystorePath;
+        if (path.startsWith("file:")) {
+            // Remove "file:" prefix and load from file system
+            path = path.substring(5);
+            try (FileInputStream fis = new FileInputStream(path)) {
+                keystore.load(fis, keystorePassword.toCharArray());
             }
-            keystore.load(is, keystorePassword.toCharArray());
+        } else {
+            // Assume classpath resource
+            try (InputStream is = getClass().getResourceAsStream(path)) {
+                if (is == null) {
+                    throw new FileNotFoundException("Keystore file not found at: " + path);
+                }
+                keystore.load(is, keystorePassword.toCharArray());
+            }
         }
-        
+
         // Get the private key
         Key key = keystore.getKey(keystoreAlias, keystorePassword.toCharArray());
         if (!(key instanceof PrivateKey)) {
             throw new RuntimeException("The specified key alias '" + keystoreAlias + "' does not contain a private key");
         }
         PrivateKey privateKey = (PrivateKey) key;
-        
+
         // Create and initialize the signature
         Signature sig = Signature.getInstance(algorithm);
         sig.initSign(privateKey);
         sig.update(canonValue.getBytes(StandardCharsets.UTF_8));
-        
+
         // Generate the signature
         return Base64.getEncoder().encodeToString(sig.sign());
     }
