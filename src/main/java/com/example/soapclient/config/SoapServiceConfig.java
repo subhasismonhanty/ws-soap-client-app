@@ -15,4 +15,9 @@ public class SoapServiceConfig {
     private String startTag = "<Add>";
     private String endTag = "</Add>";
     private String soapAction = "http://tempuri.org/Add";  // default SOAP action
+    private String username;  // username for UserInfo
+    private String correlation;  // correlation ID for UserInfo
+    private boolean proxyEnabled;  // new flag: enable proxy
+    private String proxyHost;     // proxy hostname for this service
+    private int proxyPort; // proxy port for this service
 } 

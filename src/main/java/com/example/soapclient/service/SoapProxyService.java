@@ -3,7 +3,9 @@ package com.example.soapclient.service;
 import com.example.soapclient.config.SoapServiceConfig;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.commons.codec.digest.DigestUtils;
+import net.shibboleth.utilities.java.support.httpclient.HttpClientBuilder;
+import org.apache.http.HttpHost;
+import org.apache.http.client.HttpClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -15,20 +17,33 @@ import org.springframework.ws.client.support.interceptor.ClientInterceptor;
 import org.springframework.ws.soap.SoapHeader;
 import org.springframework.ws.soap.SoapHeaderElement;
 import org.springframework.ws.soap.SoapMessage;
-import org.springframework.ws.soap.security.wss4j2.Wss4jSecurityInterceptor;
+import org.springframework.ws.transport.WebServiceMessageSender;
+import org.springframework.ws.transport.http.HttpComponentsMessageSender;
 import org.springframework.xml.transform.StringSource;
-
+import javax.xml.transform.dom.DOMSource;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import org.xml.sax.InputSource;
+import java.io.StringReader;
+import org.w3c.dom.Document;
 import javax.annotation.PostConstruct;
 import javax.xml.namespace.QName;
 import javax.xml.transform.Source;
 import javax.xml.transform.stream.StreamResult;
 import java.io.StringWriter;
-import java.security.SecureRandom;
-import java.time.ZonedDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.Base64;
+import java.security.*;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.Map;
-import java.util.UUID;
+import java.util.TimeZone;
+import java.util.Base64;
+
+import org.apache.xml.security.c14n.Canonicalizer;
+
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.io.FileNotFoundException;
+import java.nio.charset.StandardCharsets;
 
 @Service
 public class SoapProxyService {
@@ -48,20 +63,30 @@ public class SoapProxyService {
     @Autowired
     private WebServiceTemplate webServiceTemplate;
 
-    @Autowired
-    private Wss4jSecurityInterceptor securityInterceptor;
+    @Value("${keystore.path}")
+    private String keystorePath;
+
+    @Value("${keystore.password}")
+    private String keystorePassword;
+
+    @Value("${keystore.alias}")
+    private String keystoreAlias;
 
     @PostConstruct
     public void init() {
         try {
             ObjectMapper mapper = new ObjectMapper();
             serviceConfigs = mapper.readValue(servicesJson, new TypeReference<Map<String, SoapServiceConfig>>() {});
+            
+            // Initialize XML Security
+            org.apache.xml.security.Init.init();
         } catch (Exception e) {
-            throw new RuntimeException("Failed to parse soap.services configuration", e);
+            throw new RuntimeException("Failed to initialize", e);
         }
     }
 
     public String processSoapRequest(String serviceName, String xmlPayload, String soapAction, Map<String, String> headers) {
+        String response = null;
         // Get the service configuration
         SoapServiceConfig serviceConfig = serviceConfigs.get(serviceName);
         if (serviceConfig == null) {
@@ -120,15 +145,32 @@ public class SoapProxyService {
         StringWriter responseWriter = new StringWriter();
         StreamResult result = new StreamResult(responseWriter);
 
+        //Save default senders so we can restore later
+        WebServiceMessageSender[] defaultSenders = webServiceTemplate.getMessageSenders();
+
         try {
-            // Configure security interceptor based on headerRequired
-            if (serviceConfig.isHeaderRequired()) {
-                logger.info("Adding security interceptor for service: {}", serviceName);
-                webServiceTemplate.setInterceptors(new ClientInterceptor[]{securityInterceptor});
-            } else {
-                logger.info("Removing security interceptor for service: {}", serviceName);
-                webServiceTemplate.setInterceptors(new ClientInterceptor[]{});
+            // Remove all interceptors to prevent WSS4J from adding its headers
+            webServiceTemplate.setInterceptors(new ClientInterceptor[]{});
+
+            // --- NEW: configure HTTP proxy if set in config ---
+            if (serviceConfig.isProxyEnabled()
+                    && serviceConfig.getProxyHost() != null
+                    && serviceConfig.getProxyPort() > 0) {
+
+                HttpComponentsMessageSender httpSender = new HttpComponentsMessageSender();
+                HttpHost proxy = new HttpHost(
+                        serviceConfig.getProxyHost(),
+                        serviceConfig.getProxyPort()
+                );
+                HttpClientBuilder builder = new HttpClientBuilder();
+                builder.setConnectionProxyHost(serviceConfig.getProxyHost());
+                builder.setConnectionProxyPort(serviceConfig.getProxyPort());
+                HttpClient client = builder.buildClient();
+
+                httpSender.setHttpClient(client);
+                webServiceTemplate.setMessageSender(httpSender);
             }
+            // --- end proxy configuration ---
 
             // Create message callback with configurable envelope settings
             WebServiceMessageCallback messageCallback = message -> {
@@ -155,6 +197,11 @@ public class SoapProxyService {
                         serviceConfig.getBodyNamespace()
                     );
                 }
+
+                // Add our custom security header if required
+                if (serviceConfig.isHeaderRequired()) {
+                    addSecurityHeader(soapMessage, serviceName);
+                }
             };
 
             // Send request to SOAP service
@@ -165,121 +212,177 @@ public class SoapProxyService {
                 result
             );
 
-            String response = responseWriter.toString();
+            response = responseWriter.toString();
             logger.debug("Received SOAP response: {}", response);
-            return response;
 
+        } catch (Exception e) {
+            e.printStackTrace();
         } finally {
             // Reset interceptors to default state
+            webServiceTemplate.setMessageSenders(defaultSenders);
             webServiceTemplate.setInterceptors(new ClientInterceptor[]{});
         }
+        return response;
     }
 
-    private void addSecurityHeader(SoapMessage soapMessage) {
-        SoapHeader header = soapMessage.getSoapHeader();
+    private String createDigest(String algorithm, String userInfoContent) throws Exception {
+        MessageDigest msgDigest = MessageDigest.getInstance(algorithm, "SUN");
+        msgDigest.update(userInfoContent.getBytes());
+        return Base64.getEncoder().encodeToString(msgDigest.digest());
+    }
+
+    private String canonicalize(String signedInfoString) throws Exception {
+        // Parse the SignedInfo XML
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+        factory.setNamespaceAware(true);
+        DocumentBuilder builder = factory.newDocumentBuilder();
+        Document doc = builder.parse(new InputSource(new StringReader(signedInfoString)));
+
+        // Canonicalize the SignedInfo using ByteArrayOutputStream
+        Canonicalizer canonicalizer = Canonicalizer.getInstance(Canonicalizer.ALGO_ID_C14N_EXCL_OMIT_COMMENTS);
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        canonicalizer.canonicalizeSubtree(doc.getDocumentElement(), baos);
+        return baos.toString("UTF-8");
+    }
+
+    private String createSignature(String algorithm, String canonValue) throws Exception {
+        // Load the keystore from classpath
+        KeyStore keystore = KeyStore.getInstance("JKS");
+        try (InputStream is = getClass().getResourceAsStream(keystorePath)) {
+            if (is == null) {
+                throw new FileNotFoundException("Keystore file not found at: " + keystorePath);
+            }
+            keystore.load(is, keystorePassword.toCharArray());
+        }
         
-        // Create Security element
-        QName securityQName = new QName(
-            "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd",
-            "Security",
-            "wsse"
-        );
-        SoapHeaderElement security = header.addHeaderElement(securityQName);
-        security.addAttribute(new QName("http://schemas.xmlsoap.org/soap/envelope/", "mustUnderstand"), "1");
-        security.addAttribute(new QName("xmlns:wsu"), 
-            "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd");
-
-        // Add Timestamp
-        QName timestampQName = new QName(
-            "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd",
-            "Timestamp",
-            "wsu"
-        );
-        SoapHeaderElement timestamp = header.addHeaderElement(timestampQName);
-        String timestampId = "TS-" + UUID.randomUUID();
-        timestamp.addAttribute(new QName(
-            "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd",
-            "Id",
-            "wsu"
-        ), timestampId);
-
-        // Add Created and Expires elements
-        ZonedDateTime now = ZonedDateTime.now();
-        ZonedDateTime expiresTime = now.plusMinutes(5);
-        DateTimeFormatter formatter = DateTimeFormatter.ISO_INSTANT;
-
-        QName createdQName = new QName(
-            "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd",
-            "Created",
-            "wsu"
-        );
-        SoapHeaderElement created = header.addHeaderElement(createdQName);
-        created.setText(formatter.format(now));
-
-        QName expiresQName = new QName(
-            "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd",
-            "Expires",
-            "wsu"
-        );
-        SoapHeaderElement expires = header.addHeaderElement(expiresQName);
-        expires.setText(formatter.format(expiresTime));
-
-        // Add UsernameToken
-        QName usernameTokenQName = new QName(
-            "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd",
-            "UsernameToken",
-            "wsse"
-        );
-        SoapHeaderElement usernameToken = header.addHeaderElement(usernameTokenQName);
-        String tokenId = "UsernameToken-" + UUID.randomUUID();
-        usernameToken.addAttribute(new QName(
-            "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd",
-            "Id",
-            "wsu"
-        ), tokenId);
-
-        // Add Username
-        QName usernameQName = new QName(
-            "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd",
-            "Username",
-            "wsse"
-        );
-        SoapHeaderElement usernameElement = header.addHeaderElement(usernameQName);
-        usernameElement.setText(username);
-
-        // Generate nonce
-        byte[] nonceBytes = new byte[16];
-        new SecureRandom().nextBytes(nonceBytes);
-        String nonce = Base64.getEncoder().encodeToString(nonceBytes);
+        // Get the private key
+        Key key = keystore.getKey(keystoreAlias, keystorePassword.toCharArray());
+        if (!(key instanceof PrivateKey)) {
+            throw new RuntimeException("The specified key alias '" + keystoreAlias + "' does not contain a private key");
+        }
+        PrivateKey privateKey = (PrivateKey) key;
         
-        // Create password digest
-        String createdTime = formatter.format(now);
-        String passwordDigest = DigestUtils.sha1Hex(nonce + createdTime + password);
+        // Create and initialize the signature
+        Signature sig = Signature.getInstance(algorithm);
+        sig.initSign(privateKey);
+        sig.update(canonValue.getBytes(StandardCharsets.UTF_8));
+        
+        // Generate the signature
+        return Base64.getEncoder().encodeToString(sig.sign());
+    }
 
-        // Add Password
-        QName passwordQName = new QName(
-            "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd",
-            "Password",
-            "wsse"
-        );
-        SoapHeaderElement passwordElement = header.addHeaderElement(passwordQName);
-        passwordElement.addAttribute(new QName("Type"), 
-            "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest");
-        passwordElement.setText(passwordDigest);
+    private void addSecurityHeader(SoapMessage soapMessage, String serviceName) {
+        try {
+            SoapHeader header = soapMessage.getSoapHeader();
+            
+            // Get current service config
+            SoapServiceConfig serviceConfig = serviceConfigs.get(serviceName);
+            
+            // Create timestamp in GMT+00:00
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMddHHmm");
+            sdf.setTimeZone(TimeZone.getTimeZone("GMT"));
+            String timestamp = sdf.format(new Date());
+            
+            // Get username and correlation from service config
+            String effectiveUsername = serviceConfig != null && serviceConfig.getUsername() != null ? 
+                serviceConfig.getUsername() : username;
+            String effectiveCorr = serviceConfig != null && serviceConfig.getCorrelation() != null ? 
+                serviceConfig.getCorrelation() : "_CORR_";
+            
+            // Format the UserInfo string
+            String userInfoContent = String.format("USER=%s;CORR=%s;TIMESTAMP=%s", 
+                effectiveUsername, 
+                effectiveCorr, 
+                timestamp);
 
-        // Add Nonce
-        QName nonceQName = new QName(
-            "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd",
-            "Nonce",
-            "wsse"
-        );
-        SoapHeaderElement nonceElement = header.addHeaderElement(nonceQName);
-        nonceElement.addAttribute(new QName("EncodingType"), 
-            "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary");
-        nonceElement.setText(nonce);
+            // Create Security element
+            QName securityQName = new QName(
+                "http://schemas.xmlsoap.org/ws/2002/4/secext",
+                "Security",
+                "wsse"
+            );
+            SoapHeaderElement security = header.addHeaderElement(securityQName);
 
-        // Add Created to UsernameToken
-        SoapHeaderElement createdElement = header.addHeaderElement(createdQName);
-        createdElement.setText(createdTime);
+            // Add DisableInclusivePrefixList
+            String disablePrefix = 
+                "<sunsp:DisableInclusivePrefixList xmlns:sunsp=\"htt://schemas.sun.com/2006/03/wss/client\"></sunsp:DisableInclusivePrefixList>";
+
+            // Create digest value
+            String digestValue = createDigest("SHA1", userInfoContent);
+
+            // Create SignedInfo section
+            String signedInfoString = String.format(
+                "<ds:SignedInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">" +
+                "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" +
+                "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2000/09/xmldsig#rsa-sha1\"/>" +
+                "<ds:Reference URI=\"#secinfo\">" +
+                "<ds:DigestMethod Algorithm=\"http://www.w3.org/2000/09/xmldsig#sha1\"/>" +
+                "<ds:DigestValue>%s</ds:DigestValue>" +
+                "<ds:Transforms>" +
+                "<ds:Transform Algorithm=\"http://www.w3.org/TR/1999/REC-xpath-19991116\">" +
+                "<ds:XPath>//*[@id='secinfo']/child::*/text()</ds:XPath>" +
+                "</ds:Transform>" +
+                "</ds:Transforms>" +
+                "</ds:Reference>" +
+                "</ds:SignedInfo>",
+                digestValue
+            );
+
+            // Canonicalize SignedInfo
+            String canonicalizedSignedInfo = canonicalize(signedInfoString);
+
+            // Create signature value
+            String signatureValue = createSignature("SHA1withRSA", canonicalizedSignedInfo);
+
+            // Create complete Signature section
+            String signatureSection = String.format(
+                "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">" +
+                "%s" +
+                "<ds:SignatureValue>%s</ds:SignatureValue>" +
+                "<ds:KeyInfo>" +
+                "<ds:KeyName>%s</ds:KeyName>" +
+                "</ds:KeyInfo>" +
+                "</ds:Signature>",
+                signedInfoString,
+                signatureValue,
+                effectiveUsername
+            );
+
+            // Create UsernameToken section
+            String tokenXml = String.format(
+                "<t:UsernameToken xmlns:t=\"http://schemas.xmlsoap.org/ws/2002/4/secext\" id=\"secinfo\">" +
+                "<t:UserInfo>%s</t:UserInfo>" +
+                "</t:UsernameToken>",
+                userInfoContent
+            );
+
+            // Parse and add all sections to the security header
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            factory.setNamespaceAware(true);
+            DocumentBuilder builder = factory.newDocumentBuilder();
+
+            // Add DisableInclusivePrefixList
+            Document disableDoc = builder.parse(new InputSource(new StringReader(disablePrefix)));
+            DOMSource securitySource = (DOMSource) security.getSource();
+            org.w3c.dom.Node securityNode = securitySource.getNode();
+            securityNode.appendChild(
+                securityNode.getOwnerDocument().importNode(disableDoc.getDocumentElement(), true)
+            );
+
+            // Add Signature section
+            Document signatureDoc = builder.parse(new InputSource(new StringReader(signatureSection)));
+            securityNode.appendChild(
+                securityNode.getOwnerDocument().importNode(signatureDoc.getDocumentElement(), true)
+            );
+
+            // Add UsernameToken section
+            Document tokenDoc = builder.parse(new InputSource(new StringReader(tokenXml)));
+            securityNode.appendChild(
+                securityNode.getOwnerDocument().importNode(tokenDoc.getDocumentElement(), true)
+            );
+
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to create security header", e);
+        }
     }
 } 
