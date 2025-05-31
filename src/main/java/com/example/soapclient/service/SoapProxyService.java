@@ -162,6 +162,7 @@ public class SoapProxyService {
                     && serviceConfig.getProxyHost() != null
                     && serviceConfig.getProxyPort() > 0) {
 
+                logger.info("Using proxy {}:{} for SOAP request", serviceConfig.getProxyHost(), serviceConfig.getProxyPort());
                 HttpClientBuilder builder = HttpClientBuilder.create();
                 HttpHost proxy = new HttpHost(serviceConfig.getProxyHost(), serviceConfig.getProxyPort());
                 builder.setProxy(proxy);
