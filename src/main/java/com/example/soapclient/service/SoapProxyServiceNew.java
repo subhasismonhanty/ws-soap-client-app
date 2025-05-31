@@ -1,18 +1,12 @@
 package com.example.soapclient.service;
 
-import com.example.soapclient.config.CustomHttpComponentsMessageSender;
 import com.example.soapclient.config.SoapServiceConfig;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-
-import org.apache.http.Header;
-import org.apache.http.HttpException;
+import net.shibboleth.utilities.java.support.httpclient.HttpClientBuilder;
 import org.apache.http.HttpHost;
-import org.apache.http.HttpRequest;
 import org.apache.http.client.HttpClient;
-import org.apache.http.HttpRequestInterceptor; // Import HttpRequestInterceptor
-import org.apache.http.impl.client.HttpClientBuilder;
-import org.apache.http.protocol.HttpContext;
+import org.apache.xml.security.c14n.Canonicalizer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -27,32 +21,28 @@ import org.springframework.ws.soap.SoapMessage;
 import org.springframework.ws.transport.WebServiceMessageSender;
 import org.springframework.ws.transport.http.HttpComponentsMessageSender;
 import org.springframework.xml.transform.StringSource;
-import javax.xml.transform.dom.DOMSource;
-import javax.xml.parsers.DocumentBuilder;
-import javax.xml.parsers.DocumentBuilderFactory;
+import org.w3c.dom.Document;
 import org.xml.sax.InputSource;
 
-import java.io.*;
-
-import org.w3c.dom.Document;
 import javax.annotation.PostConstruct;
 import javax.xml.namespace.QName;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.transform.Source;
+import javax.xml.transform.dom.DOMSource;
 import javax.xml.transform.stream.StreamResult;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.security.*;
 import java.text.SimpleDateFormat;
+import java.util.Base64;
 import java.util.Date;
 import java.util.Map;
 import java.util.TimeZone;
-import java.util.Base64;
-
-import org.apache.xml.security.c14n.Canonicalizer;
-
-import java.nio.charset.StandardCharsets;
 
 @Service
-public class SoapProxyService {
-    private static final Logger logger = LoggerFactory.getLogger(SoapProxyService.class);
+public class SoapProxyServiceNew {
+    private static final Logger logger = LoggerFactory.getLogger(SoapProxyServiceNew.class);
 
     @Value("${soap.services}")
     private String servicesJson;
@@ -102,7 +92,7 @@ public class SoapProxyService {
         String effectiveSoapAction = soapAction != null ? soapAction : serviceConfig.getSoapAction();
 
         logger.info("Service: {}, headerRequired: {}, soapAction: {}",
-                serviceName, serviceConfig.isHeaderRequired(), effectiveSoapAction);
+            serviceName, serviceConfig.isHeaderRequired(), effectiveSoapAction);
         logger.info("Original payload: {}", xmlPayload);
 
         // Extract the content using configured tags
@@ -118,27 +108,27 @@ public class SoapProxyService {
             logger.info("Extracted content using tags {} and {}: {}", startTag, endTag, actualRequest);
         } else {
             throw new IllegalArgumentException(
-                    String.format("Could not find content between tags %s and %s in payload", startTag, endTag));
+                String.format("Could not find content between tags %s and %s in payload", startTag, endTag));
         }
 
         // Extract just the content between tags
         String tagContent = actualRequest.substring(
-                actualRequest.indexOf(">") + 1,
-                actualRequest.lastIndexOf("<")
+            actualRequest.indexOf(">") + 1,
+            actualRequest.lastIndexOf("<")
         ).trim();
 
         // Get namespace configuration with defaults
         String requestNamespace = serviceConfig.getRequestNamespace() != null ?
-                serviceConfig.getRequestNamespace() : "http://tempuri.org/";
+            serviceConfig.getRequestNamespace() : "http://tempuri.org/";
 
         // Create the request with configured namespace
         String tagName = startTag.substring(1, startTag.length() - 1); // Remove < and > from startTag
         String formattedRequest = String.format(
-                "<%s xmlns=\"%s\">%s</%s>",
-                tagName,
-                requestNamespace,
-                tagContent,
-                tagName
+            "<%s xmlns=\"%s\">%s</%s>",
+            tagName,
+            requestNamespace,
+            tagContent,
+            tagName
         );
 
         logger.info("Formatted request: {}", formattedRequest);
@@ -150,35 +140,32 @@ public class SoapProxyService {
         StringWriter responseWriter = new StringWriter();
         StreamResult result = new StreamResult(responseWriter);
 
-        // Store the original message sender to restore later
-        WebServiceMessageSender[] originalMessageSenders = webServiceTemplate.getMessageSenders();
+        //Save default senders so we can restore later
+        WebServiceMessageSender[] defaultSenders = webServiceTemplate.getMessageSenders();
 
         try {
             // Remove all interceptors to prevent WSS4J from adding its headers
             webServiceTemplate.setInterceptors(new ClientInterceptor[]{});
 
-            // --- MODIFIED: configure HTTP proxy and use CustomHttpComponentsMessageSender ---
+            // --- NEW: configure HTTP proxy if set in config ---
             if (serviceConfig.isProxyEnabled()
                     && serviceConfig.getProxyHost() != null
                     && serviceConfig.getProxyPort() > 0) {
 
-                HttpClientBuilder builder = HttpClientBuilder.create();
-                HttpHost proxy = new HttpHost(serviceConfig.getProxyHost(), serviceConfig.getProxyPort());
-                builder.setProxy(proxy);
+                HttpComponentsMessageSender httpSender = new HttpComponentsMessageSender();
+                HttpHost proxy = new HttpHost(
+                        serviceConfig.getProxyHost(),
+                        serviceConfig.getProxyPort()
+                );
+                HttpClientBuilder builder = new HttpClientBuilder();
+                builder.setConnectionProxyHost(serviceConfig.getProxyHost());
+                builder.setConnectionProxyPort(serviceConfig.getProxyPort());
+                HttpClient client = builder.buildClient();
 
-                // Build the HttpClient with proxy configuration
-                HttpClient client = builder.build();
-
-                // Use our custom message sender which will handle headers properly
-                CustomHttpComponentsMessageSender messageSender = new CustomHttpComponentsMessageSender(client);
-                webServiceTemplate.setMessageSender(messageSender);
-
-            } else {
-                // If no proxy is enabled, use the default HttpComponentsMessageSender
-                webServiceTemplate.setMessageSender(new HttpComponentsMessageSender());
+                httpSender.setHttpClient(client);
+                webServiceTemplate.setMessageSender(httpSender);
             }
-            // --- end modified configuration ---
-
+            // --- end proxy configuration ---
 
             // Create message callback with configurable envelope settings
             WebServiceMessageCallback messageCallback = message -> {
@@ -193,16 +180,16 @@ public class SoapProxyService {
                 // Configure envelope namespace if provided
                 if (serviceConfig.getEnvelopeNamespace() != null) {
                     soapMessage.getEnvelope().addNamespaceDeclaration(
-                            serviceConfig.getEnvelopePrefix() != null ? serviceConfig.getEnvelopePrefix() : "soap",
-                            serviceConfig.getEnvelopeNamespace()
+                        serviceConfig.getEnvelopePrefix() != null ? serviceConfig.getEnvelopePrefix() : "soap",
+                        serviceConfig.getEnvelopeNamespace()
                     );
                 }
 
                 // Configure body namespace if provided
                 if (serviceConfig.getBodyNamespace() != null) {
                     soapMessage.getEnvelope().getBody().addNamespaceDeclaration(
-                            serviceConfig.getBodyPrefix() != null ? serviceConfig.getBodyPrefix() : "soap",
-                            serviceConfig.getBodyNamespace()
+                        serviceConfig.getBodyPrefix() != null ? serviceConfig.getBodyPrefix() : "soap",
+                        serviceConfig.getBodyNamespace()
                     );
                 }
 
@@ -214,23 +201,20 @@ public class SoapProxyService {
 
             // Send request to SOAP service
             webServiceTemplate.sendSourceAndReceiveToResult(
-                    serviceConfig.getUrl(),
-                    requestSource,
-                    messageCallback,
-                    result
+                serviceConfig.getUrl(),
+                requestSource,
+                messageCallback,
+                result
             );
 
             response = responseWriter.toString();
             logger.debug("Received SOAP response: {}", response);
 
         } catch (Exception e) {
-            logger.error("Error processing SOAP request", e);
-            e.printStackTrace(); // Consider more robust error handling
-            throw new RuntimeException("Error processing SOAP request", e); // Re-throw to indicate failure
+            e.printStackTrace();
         } finally {
-            // Reset message sender to the original one
-            webServiceTemplate.setMessageSenders(originalMessageSenders);
-            // Reset interceptors to default state (which is likely empty in this case)
+            // Reset interceptors to default state
+            webServiceTemplate.setMessageSenders(defaultSenders);
             webServiceTemplate.setInterceptors(new ClientInterceptor[]{});
         }
         return response;
@@ -308,47 +292,47 @@ public class SoapProxyService {
 
             // Get username and correlation from service config
             String effectiveUsername = serviceConfig != null && serviceConfig.getUsername() != null ?
-                    serviceConfig.getUsername() : username;
+                serviceConfig.getUsername() : username;
             String effectiveCorr = serviceConfig != null && serviceConfig.getCorrelation() != null ?
-                    serviceConfig.getCorrelation() : "_CORR_";
+                serviceConfig.getCorrelation() : "_CORR_";
 
             // Format the UserInfo string
             String userInfoContent = String.format("USER=%s;CORR=%s;TIMESTAMP=%s",
-                    effectiveUsername,
-                    effectiveCorr,
-                    timestamp);
+                effectiveUsername,
+                effectiveCorr,
+                timestamp);
 
             // Create Security element
             QName securityQName = new QName(
-                    "http://schemas.xmlsoap.org/ws/2002/4/secext",
-                    "Security",
-                    "wsse"
+                "http://schemas.xmlsoap.org/ws/2002/4/secext",
+                "Security",
+                "wsse"
             );
             SoapHeaderElement security = header.addHeaderElement(securityQName);
 
             // Add DisableInclusivePrefixList
             String disablePrefix =
-                    "<sunsp:DisableInclusivePrefixList xmlns:sunsp=\"htt://schemas.sun.com/2006/03/wss/client\"></sunsp:DisableInclusivePrefixList>";
+                "<sunsp:DisableInclusivePrefixList xmlns:sunsp=\"htt://schemas.sun.com/2006/03/wss/client\"></sunsp:DisableInclusivePrefixList>";
 
             // Create digest value
             String digestValue = createDigest("SHA1", userInfoContent);
 
             // Create SignedInfo section
             String signedInfoString = String.format(
-                    "<ds:SignedInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">" +
-                            "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" +
-                            "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2000/09/xmldsig#rsa-sha1\"/>" +
-                            "<ds:Reference URI=\"#secinfo\">" +
-                            "<ds:DigestMethod Algorithm=\"http://www.w3.org/2000/09/xmldsig#sha1\"/>" +
-                            "<ds:DigestValue>%s</ds:DigestValue>" +
-                            "<ds:Transforms>" +
-                            "<ds:Transform Algorithm=\"http://www.w3.org/TR/1999/REC-xpath-19991116\">" +
-                            "<ds:XPath>//*[@id='secinfo']/child::*/text()</ds:XPath>" +
-                            "</ds:Transform>" +
-                            "</ds:Transforms>" +
-                            "</ds:Reference>" +
-                            "</ds:SignedInfo>",
-                    digestValue
+                "<ds:SignedInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">" +
+                "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" +
+                "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2000/09/xmldsig#rsa-sha1\"/>" +
+                "<ds:Reference URI=\"#secinfo\">" +
+                "<ds:DigestMethod Algorithm=\"http://www.w3.org/2000/09/xmldsig#sha1\"/>" +
+                "<ds:DigestValue>%s</ds:DigestValue>" +
+                "<ds:Transforms>" +
+                "<ds:Transform Algorithm=\"http://www.w3.org/TR/1999/REC-xpath-19991116\">" +
+                "<ds:XPath>//*[@id='secinfo']/child::*/text()</ds:XPath>" +
+                "</ds:Transform>" +
+                "</ds:Transforms>" +
+                "</ds:Reference>" +
+                "</ds:SignedInfo>",
+                digestValue
             );
 
             // Canonicalize SignedInfo
@@ -359,24 +343,24 @@ public class SoapProxyService {
 
             // Create complete Signature section
             String signatureSection = String.format(
-                    "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">" +
-                            "%s" +
-                            "<ds:SignatureValue>%s</ds:SignatureValue>" +
-                            "<ds:KeyInfo>" +
-                            "<ds:KeyName>%s</ds:KeyName>" +
-                            "</ds:KeyInfo>" +
-                            "</ds:Signature>",
-                    signedInfoString,
-                    signatureValue,
-                    effectiveUsername
+                "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">" +
+                "%s" +
+                "<ds:SignatureValue>%s</ds:SignatureValue>" +
+                "<ds:KeyInfo>" +
+                "<ds:KeyName>%s</ds:KeyName>" +
+                "</ds:KeyInfo>" +
+                "</ds:Signature>",
+                signedInfoString,
+                signatureValue,
+                effectiveUsername
             );
 
             // Create UsernameToken section
             String tokenXml = String.format(
-                    "<t:UsernameToken xmlns:t=\"http://schemas.xmlsoap.org/ws/2002/4/secext\" id=\"secinfo\">" +
-                            "<t:UserInfo>%s</t:UserInfo>" +
-                            "</t:UsernameToken>",
-                    userInfoContent
+                "<t:UsernameToken xmlns:t=\"http://schemas.xmlsoap.org/ws/2002/4/secext\" id=\"secinfo\">" +
+                "<t:UserInfo>%s</t:UserInfo>" +
+                "</t:UsernameToken>",
+                userInfoContent
             );
 
             // Parse and add all sections to the security header
@@ -389,19 +373,19 @@ public class SoapProxyService {
             DOMSource securitySource = (DOMSource) security.getSource();
             org.w3c.dom.Node securityNode = securitySource.getNode();
             securityNode.appendChild(
-                    securityNode.getOwnerDocument().importNode(disableDoc.getDocumentElement(), true)
+                securityNode.getOwnerDocument().importNode(disableDoc.getDocumentElement(), true)
             );
 
             // Add Signature section
             Document signatureDoc = builder.parse(new InputSource(new StringReader(signatureSection)));
             securityNode.appendChild(
-                    securityNode.getOwnerDocument().importNode(signatureDoc.getDocumentElement(), true)
+                securityNode.getOwnerDocument().importNode(signatureDoc.getDocumentElement(), true)
             );
 
             // Add UsernameToken section
             Document tokenDoc = builder.parse(new InputSource(new StringReader(tokenXml)));
             securityNode.appendChild(
-                    securityNode.getOwnerDocument().importNode(tokenDoc.getDocumentElement(), true)
+                securityNode.getOwnerDocument().importNode(tokenDoc.getDocumentElement(), true)
             );
 
         } catch (Exception e) {

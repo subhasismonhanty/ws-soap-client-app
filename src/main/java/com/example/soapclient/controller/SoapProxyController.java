@@ -8,6 +8,7 @@ import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+@CrossOrigin
 @RestController
 @RequestMapping("/api/soap")
 public class SoapProxyController {
